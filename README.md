@@ -1,6 +1,6 @@
 # Sortea
 
-Una web de sorteos en español que funciona en el navegador. Añade participantes, elige cuántos ganadores necesitas y realiza un sorteo sin repetir nombres en el mismo resultado.
+Una web de sorteos en español con boletos, premios por etapas e imágenes. Prepara un evento, asigna boletos a cada persona y sortea sus premios desde el navegador.
 
 ## Desarrollo
 
@@ -14,7 +14,7 @@ npm run dev
 El servidor de desarrollo escucha en el puerto **5173**. Para usar otro puerto: `npm run dev -- --port 5174`. Usa un navegador moderno con JavaScript habilitado; el contexto local o HTTPS permite utilizar Web Crypto.
 
 ```sh
-npm test          # Núcleo de selección aleatoria y servidor HTTP
+npm test          # Boletos, selección aleatoria y servidor HTTP
 npm run build    # Genera dist/ a partir de index.html y src/
 npm run preview  # Sirve dist/ en el puerto 4173
 ```
@@ -27,18 +27,25 @@ Para probar el resultado compilado en lugar de los archivos de desarrollo: `BROW
 
 ## Uso
 
-- Introduce un participante por línea o importa un archivo `.txt` con ese mismo formato.
-- Los nombres vacíos y duplicados se descartan; las diferencias de mayúsculas no generan participantes adicionales.
-- Configura el título y el número de ganadores, y ejecuta el sorteo.
-- Consulta el historial local y descarga los resultados en CSV.
+- Introduce una persona por línea. Un nombre sin cantidad equivale a un boleto; `Ana;5` o `Ana,5` asigna cinco boletos.
+- Repetir un nombre **suma boletos**: `Ana;2`, `ana` y `Ana;3` se combinan en una sola persona con seis boletos. Se ignoran diferencias de mayúsculas, espacios y normalización Unicode.
+- Importa texto UTF-8 con el mismo formato. Se conservan los participantes existentes y se suman los boletos de los nombres que ya estaban. También se admite una cabecera `Nombre;Boletos`. Encierra entre comillas los nombres que contengan comas o punto y coma.
+- Configura hasta **20 etapas**, cada una con nombre de premio, cantidad de ganadores e imagen opcional. Puedes añadir, quitar y ordenar las etapas pendientes; se sortean en ese orden.
+- Sortea una etapa y prepara la siguiente. Los resultados identifican a la persona y el número del boleto premiado. Consulta el historial y descarga cada resultado en CSV con su premio y sus boletos.
 
-Puedes añadir hasta 5.000 participantes por sorteo, con un máximo de 200 caracteres por nombre. Los archivos de texto deben usar UTF-8 y pesar menos de 1 MB; al importar se conservan los nombres existentes. Se guardan los últimos 100 sorteos. La opción «Que la suerte se reparta» excluye a los ganadores de todos los sorteos de ese historial; puedes desactivarla para volver a incluirlos. La descarga CSV protege los campos que podrían interpretarse como fórmulas en una hoja de cálculo.
+La tabla de participantes muestra personas, boletos y probabilidad. Cada boleto elegible tiene la misma oportunidad: una persona con tres de los diez boletos restantes tiene un 30 % de probabilidad en la próxima extracción. Si una etapa selecciona varios ganadores, las probabilidades se recalculan al retirar cada boleto o persona seleccionada; la probabilidad mostrada no es una garantía de ganar durante toda la etapa.
 
-La selección utiliza `crypto.getRandomValues` con muestreo sin sesgo y sin reemplazo. El sitio no constituye una certificación independiente ni un mecanismo de auditoría de concursos regulados.
+Con **«Un premio por persona»** activado, cada persona puede ganar una sola vez en todas las etapas del evento. Al desactivarlo, una persona puede ganar varios premios mediante boletos diferentes; un boleto premiado nunca vuelve a participar dentro del mismo evento. **«Empezar otra sesión»** prepara un nuevo evento: reinicia las etapas y las exclusiones y conserva los participantes, los premios, sus imágenes y el historial. Los sorteos de eventos anteriores no reducen las oportunidades del nuevo evento. Borrar el historial requiere confirmación y también reinicia las etapas.
+
+Puedes añadir hasta 5.000 personas, 200 caracteres por nombre y 1.000.000 de boletos por persona; el total no puede superar 4.294.967.296 boletos. Las cantidades deben ser enteros positivos. Los archivos de participantes deben pesar menos de 1 MB. Se guardan los últimos 100 resultados. La descarga CSV protege los campos que podrían interpretarse como fórmulas en una hoja de cálculo.
+
+Las fotos de premios aceptan **JPG, PNG, WebP o GIF de hasta 8 MB**. Se validan, se ajustan a un máximo de 1.280 píxeles por lado y se recomprimen a WebP o JPEG de hasta 300 KiB antes de guardarlas. Las imágenes animadas se convierten en una imagen estática y no se admiten SVG. Puedes retirar o sustituir una foto sin subirla a ningún servidor.
+
+La selección utiliza `crypto.getRandomValues` con muestreo sin sesgo y sin reemplazo de boletos. El sitio no constituye una certificación independiente ni un mecanismo de auditoría de concursos regulados.
 
 ## Datos y privacidad
 
-Los participantes, la configuración y el historial se guardan en `localStorage`, dentro de este navegador y origen. No hay backend, cuentas de usuario, analítica ni envío de participantes a un servidor. Borrar los datos del sitio, cambiar de navegador o usar una sesión privada puede eliminar o aislar esos datos. Exporta los resultados que quieras conservar.
+Los participantes, las etapas, la configuración y el historial se guardan en `localStorage`. Las fotos se guardan como archivos comprimidos en **IndexedDB**, sin llenar `localStorage` con imágenes. Todo queda dentro de este navegador y origen: no hay backend, cuentas de usuario, analítica, sincronización ni envío de participantes o fotos a un servidor. Borrar los datos del sitio, cambiar de navegador o usar una sesión privada puede eliminar o aislar esos datos. Exporta los resultados que quieras conservar. Los datos de la versión anterior se migran al abrir la aplicación.
 
 La interfaz ofrece etiquetas para formularios, navegación por teclado, estados anunciados a lectores de pantalla y adaptación a pantallas pequeñas. Respeta la preferencia del sistema de reducir movimiento.
 
