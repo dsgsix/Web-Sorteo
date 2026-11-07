@@ -1,5 +1,6 @@
-import { parseTicketParticipants, drawTicketWinners, normalizeNameKey, resultsToCSV } from './lib/raffle.js';
+import { parseTicketParticipants, drawTicketWinners, normalizeNameKey, normalizeTicketId, serializeTicketParticipants, mergeTicketParticipants, resultsToCSV } from './lib/raffle.js';
 import { preparePrizeImage, savePrizeImage, loadPrizeImage, deletePrizeImage } from './lib/prize-images.js';
+import { readRaffleWorkbook } from './lib/workbook-import.js';
 
 const $ = (id) => document.getElementById(id);
 const STORAGE_KEY = 'sortea.workspace.v2';
@@ -22,6 +23,8 @@ let pendingUploads = 0;
 let toastTimer;
 let imageRenderVersion = 0;
 let storageWarningShown = false;
+let isImporting = false;
+let pendingImport = null;
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -53,6 +56,10 @@ function showError(message, focusId) {
   if (focusId) $(focusId).focus();
 }
 function hideError() { $('form-error').hidden = true; }
+function validTicketId(value) {
+  if (typeof value !== 'string' || /[\u0000-\u001f\u007f]/u.test(value)) return false;
+  try { normalizeTicketId(value); return true; } catch { return false; }
+}
 function persist() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
@@ -80,6 +87,7 @@ function validDraw(draw) {
       draw.winnerDetails.every((winner, index) => winner && winner.name === draw.winners[index] &&
         Number.isInteger(winner.ticketNumber) && winner.ticketNumber > 0 && Number.isInteger(winner.tickets) &&
         winner.ticketNumber <= winner.tickets && winner.tickets <= 1000000 &&
+        (winner.ticketId === undefined || validTicketId(winner.ticketId)) &&
         Number.isFinite(winner.probability) && winner.probability > 0 && winner.probability <= 1)));
 }
 function restore() {
@@ -119,7 +127,7 @@ function exclusions() {
   const draws = history.filter((draw) => draw.sessionId === sessionId);
   return {
     excludeNames: $('exclude-winners').checked ? draws.flatMap((draw) => draw.winners) : [],
-    excludeTickets: draws.flatMap((draw) => draw.winnerDetails || []).map(({ name, ticketNumber }) => ({ name, ticketNumber })),
+    excludeTickets: draws.flatMap((draw) => draw.winnerDetails || []).map(({ name, ticketNumber, ticketId }) => ({ name, ticketNumber, ticketId })),
   };
 }
 function participantState() {
@@ -127,14 +135,17 @@ function participantState() {
   const options = exclusions();
   const names = new Set(options.excludeNames.map(normalizeNameKey));
   const spent = new Map();
+  const spentIds = new Set();
   for (const ticket of options.excludeTickets) {
+    if (ticket.ticketId !== undefined) { spentIds.add(normalizeTicketId(ticket.ticketId)); continue; }
     const key = normalizeNameKey(ticket.name);
     if (!spent.has(key)) spent.set(key, new Set());
     spent.get(key).add(ticket.ticketNumber);
   }
   const available = parsed.participants.map((person) => {
     const key = normalizeNameKey(person.name);
-    const used = [...(spent.get(key) || [])].filter((number) => number <= person.tickets).length;
+    const used = person.ticketIds ? person.ticketIds.filter((id) => spentIds.has(normalizeTicketId(id))).length :
+      [...(spent.get(key) || [])].filter((number) => number <= person.tickets).length;
     return { ...person, available: names.has(key) ? 0 : person.tickets - used };
   });
   return { ...parsed, available, eligibleTickets: available.reduce((sum, person) => sum + person.available, 0),
@@ -171,6 +182,7 @@ function updateParticipants() {
   for (const person of state.available.slice(0, 100)) {
     const row = element('tr');
     row.append(element('td', '', person.name), element('td', '', numberFormat.format(person.tickets)),
+      element('td', 'participant-ticket-ids', person.ticketIds ? `${person.ticketIds.slice(0, 12).join(', ')}${person.ticketIds.length > 12 ? ` y ${person.ticketIds.length - 12} más` : ''}` : 'Numeración interna'),
       element('td', '', state.eligibleTickets ? percent(person.available / state.eligibleTickets) : '0 %'));
     $('participants-preview').append(row);
   }
@@ -359,7 +371,10 @@ function showResults(draw) {
     const content = element('div', 'winner-content');
     content.append(element('span', 'winner-name', name));
     const ticket = draw.winnerDetails?.[index];
-    if (ticket) content.append(element('small', 'winner-meta', `Boleto ${numberFormat.format(ticket.ticketNumber)} de ${numberFormat.format(ticket.tickets)} · Prob. de la persona al inicio: ${percent(ticket.probability)}`));
+    if (ticket) {
+      content.append(element('strong', 'winner-ticket', ticket.ticketId !== undefined ? `Boleto N.º ${ticket.ticketId}` : `Boleto interno N.º ${ticket.ticketNumber}`));
+      content.append(element('small', 'winner-meta', `${numberFormat.format(ticket.tickets)} boleto${ticket.tickets === 1 ? '' : 's'} registrado${ticket.tickets === 1 ? '' : 's'} · Prob. de la persona al inicio: ${percent(ticket.probability)}`));
+    }
     item.append(element('span', 'winner-rank', index + 1), content);
     $('winner-list').append(item);
   }
@@ -368,10 +383,10 @@ function showResults(draw) {
 }
 function updateControls() {
   const stage = selectedStage();
-  const blocked = isDrawing || pendingUploads > 0;
+  const blocked = isDrawing || pendingUploads > 0 || isImporting;
   const canDraw = stage && !stage.completedDrawId && stage === nextPending() && !activeDraw;
   $('draw-button').disabled = blocked || !canDraw;
-  $('draw-button-label').textContent = isDrawing ? 'Eligiendo el boleto ganador…' : pendingUploads ? 'Guardando imagen…' : canDraw ? 'Sortear este premio' : nextPending() ? 'Prepara la siguiente etapa' : 'Evento completado';
+  $('draw-button-label').textContent = isDrawing ? 'Eligiendo el boleto ganador…' : isImporting ? 'Leyendo la lista…' : pendingUploads ? 'Guardando imagen…' : canDraw ? 'Sortear este premio' : nextPending() ? 'Prepara la siguiente etapa' : 'Evento completado';
   $('winner-count').disabled = blocked || !canDraw;
   $('exclude-winners').disabled = blocked;
   $('decrease-count').disabled = blocked || !canDraw || Number($('winner-count').value) <= 1;
@@ -381,7 +396,7 @@ function updateControls() {
   $('clear-history').disabled = blocked;
   $('next-stage').hidden = !activeDraw || !nextPending();
   $('next-stage').disabled = blocked;
-  for (const id of ['participants', 'raffle-title', 'import-button', 'file-input', 'example-button']) $(id).disabled = isDrawing;
+  for (const id of ['participants', 'raffle-title', 'import-button', 'file-input', 'example-button']) $(id).disabled = isDrawing || isImporting;
   for (const control of $('history-list').querySelectorAll('button')) control.disabled = blocked;
   $('stage-card').classList.toggle('is-drawing', isDrawing);
   $('stage-card').setAttribute('aria-busy', String(isDrawing));
@@ -399,7 +414,7 @@ function celebrate() {
 
 $('raffle-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  if (isDrawing || pendingUploads) return;
+  if (isDrawing || pendingUploads || isImporting) return;
   hideError();
   const stage = selectedStage();
   if (!stage || stage.completedDrawId || stage !== nextPending() || activeDraw) return;
@@ -427,7 +442,7 @@ $('raffle-form').addEventListener('submit', async (event) => {
   history.unshift(draw); history = history.slice(0, MAX_HISTORY); stage.completedDrawId = draw.id;
   isDrawing = false; persist(); renderStages(); renderHistory(); showResults(draw); updateParticipants(); celebrate();
   for (const entry of expired) cleanImage(entry.prizeImageId);
-  $('draw-announcement').textContent = `${draw.prize}: ${draw.winners.slice(0, 10).join(', ')}${draw.winners.length > 10 ? ' y más ganadores' : ''}.`;
+  $('draw-announcement').textContent = `${draw.prize}: ${draw.winnerDetails.slice(0, 10).map((winner) => `${winner.name}, boleto ${winner.ticketId ?? winner.ticketNumber}`).join('; ')}${draw.winners.length > 10 ? ' y más ganadores' : ''}.`;
   $('result-title').focus({ preventScroll: true });
   if (matchMedia('(max-width: 760px)').matches) $('stage-card').scrollIntoView({ behavior: 'smooth', block: 'start' });
 });
@@ -445,8 +460,9 @@ $('winner-count').addEventListener('input', () => changeCount($('winner-count').
 for (const [id, delta] of [['decrease-count', -1], ['increase-count', 1]]) $(id).addEventListener('click', () => changeCount(Math.max(1, Math.min(5000, (Number($('winner-count').value) || 1) + delta))));
 $('example-button').addEventListener('click', () => {
   const lines = 'Ana García;5\nCarlos López;2\nMaría Rodríguez;3\nDiego Pérez;1\nLucía Torres;4';
-  const combined = `${$('participants').value}${$('participants').value ? '\n' : ''}${lines}`;
   try {
+    const combined = serializeTicketParticipants(mergeTicketParticipants(
+      parseTicketParticipants($('participants').value).participants, parseTicketParticipants(lines).participants));
     if (combined.length > MAX_TEXT) throw new Error('La lista alcanzó su límite de texto.');
     parseTicketParticipants(combined); $('participants').value = combined; hideError(); updateParticipants(); persist();
     notify('Se añadieron 15 boletos de ejemplo. Los nombres repetidos suman sus boletos.');
@@ -455,20 +471,76 @@ $('example-button').addEventListener('click', () => {
 $('import-button').addEventListener('click', () => $('file-input').click());
 $('file-input').addEventListener('change', async () => {
   const file = $('file-input').files[0]; if (!file) return;
+  if (isDrawing || isImporting) return;
+  isImporting = true; updateControls();
   try {
+    if (/\.xlsx$/iu.test(file.name)) {
+      const workbook = await readRaffleWorkbook(file);
+      pendingImport = { ...workbook, text: null };
+      $('import-sheet').replaceChildren();
+      for (const [index, sheet] of workbook.sheets.entries()) {
+        const option = element('option', '', sheet.name); option.value = String(index); $('import-sheet').append(option);
+      }
+      renderWorkbookPreview();
+      $('import-dialog').showModal();
+      return;
+    }
+    if (/\.xls$/iu.test(file.name)) throw new Error('Guarda el Excel como .xlsx antes de importarlo.');
     if (file.size > 1024 * 1024) throw new Error('El archivo de participantes debe pesar menos de 1 MB.');
     const text = await file.text(); if (isDrawing) return;
     if (text.includes('\0')) throw new Error('Usa un archivo TXT o CSV en UTF-8.');
     const incoming = parseTicketParticipants(text);
     const current = parseTicketParticipants($('participants').value);
-    const encode = (person) => `"${person.name.replaceAll('"', '""')}";${person.tickets}`;
-    const combined = [...current.participants, ...incoming.participants].map(encode).join('\n');
+    const combined = serializeTicketParticipants(mergeTicketParticipants(current.participants, incoming.participants));
     if (combined.length > MAX_TEXT) throw new Error('El contenido supera los 200.000 caracteres.');
     parseTicketParticipants(combined); $('participants').value = combined;
-    hideError(); updateParticipants(); persist(); notify('Participantes importados. Se sumaron los boletos de los nombres existentes.');
+    hideError(); updateParticipants(); persist(); notify(incoming.participants.some((person) => person.ticketIds) ?
+      'Boletos importados con sus números originales.' : 'Participantes importados. Se sumaron los boletos de los nombres existentes.');
   } catch (error) { showError(error.message || 'No se pudo leer el archivo.'); }
-  finally { $('file-input').value = ''; }
+  finally { $('file-input').value = ''; isImporting = false; updateControls(); }
 });
+
+function renderWorkbookPreview() {
+  if (!pendingImport) return;
+  pendingImport.text = null;
+  $('import-error').hidden = true;
+  $('import-confirm').disabled = true;
+  $('import-preview').replaceChildren();
+  const sheet = pendingImport.sheets[Number($('import-sheet').value)];
+  if (!sheet) return;
+  const assigned = sheet.rows.filter((row) => row.name.trim());
+  const unassigned = sheet.rows.length - assigned.length + (sheet.skippedEmpty || 0);
+  $('import-warning').textContent = 'Participan todos los boletos con nombre. El estado y la fecha de pago no se utilizan para filtrar.';
+  try {
+    if (!assigned.length) throw new Error('Esta hoja no contiene boletos asignados a una persona.');
+    const quote = (value) => `"${String(value).replaceAll('"', '""')}"`;
+    const text = ['Nombre;Boleto', ...assigned.map((row) => `${quote(row.name)};${quote(row.ticketId)}`)].join('\n');
+    const parsed = parseTicketParticipants(text);
+    if (text.length > MAX_TEXT) throw new Error('Esta lista supera los 200.000 caracteres admitidos.');
+    pendingImport.text = serializeTicketParticipants(parsed.participants);
+    if (pendingImport.text.length > MAX_TEXT) throw new Error('Esta lista supera los 200.000 caracteres admitidos.');
+    $('import-summary').textContent = `${numberFormat.format(parsed.totalTickets)} boletos de ${numberFormat.format(parsed.participants.length)} personas. Se omiten ${numberFormat.format(unassigned)} filas sin nombre o vacías.`;
+    for (const row of assigned.slice(0, 10)) {
+      const item = element('tr'); item.append(element('td', '', row.ticketId), element('td', '', row.name)); $('import-preview').append(item);
+    }
+    $('import-confirm').disabled = false;
+  } catch (error) {
+    pendingImport.text = null;
+    $('import-summary').textContent = `${numberFormat.format(assigned.length)} filas con nombre; ${numberFormat.format(unassigned)} sin nombre.`;
+    $('import-error').textContent = error.message || 'No se pudo validar la lista.';
+    $('import-error').hidden = false;
+  }
+}
+$('import-sheet').addEventListener('change', renderWorkbookPreview);
+$('import-confirm').addEventListener('click', () => {
+  if (!pendingImport?.text || isDrawing) return;
+  const imported = parseTicketParticipants(pendingImport.text);
+  $('participants').value = pendingImport.text;
+  pendingImport = null; $('import-dialog').close();
+  hideError(); updateParticipants(); persist();
+  notify(`${numberFormat.format(imported.totalTickets)} boletos importados con su numeración original. Los boletos sin nombre se omitieron.`);
+});
+$('import-dialog').addEventListener('close', () => { pendingImport = null; });
 $('add-stage').addEventListener('click', () => {
   if (isDrawing || pendingUploads || stages.length >= MAX_STAGES) return;
   const hadPending = nextPending(); const stage = newStage(); stages.push(stage);
@@ -480,7 +552,7 @@ $('next-stage').addEventListener('click', () => { prepareStage(nextPending()); $
 $('copy-results').addEventListener('click', async () => {
   if (!activeDraw) return;
   const draw = activeDraw;
-  const text = `${draw.title}\n${draw.stageName || 'Sorteo'} · ${draw.prize || 'Resultado'}\n${dateFormat.format(new Date(draw.createdAt))}\n\n${draw.winners.map((name, index) => `${index + 1}. ${name}${draw.winnerDetails?.[index] ? ` — boleto ${draw.winnerDetails[index].ticketNumber}` : ''}`).join('\n')}`;
+  const text = `${draw.title}\n${draw.stageName || 'Sorteo'} · ${draw.prize || 'Resultado'}\n${dateFormat.format(new Date(draw.createdAt))}\n\n${draw.winners.map((name, index) => `${index + 1}. ${name}${draw.winnerDetails?.[index] ? ` — boleto ${draw.winnerDetails[index].ticketId ?? draw.winnerDetails[index].ticketNumber}` : ''}`).join('\n')}`;
   try { await navigator.clipboard.writeText(text); notify('Resultado copiado con su premio y boleto ganador.'); }
   catch { notify('El navegador bloqueó la copia. Puedes descargar el CSV.'); }
 });

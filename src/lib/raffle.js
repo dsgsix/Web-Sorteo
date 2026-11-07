@@ -13,6 +13,34 @@ export function normalizeNameKey(value) {
 
 const nameKey = normalizeNameKey;
 
+function displayTicketId(value) {
+  if (typeof value !== 'string') throw new TypeError('El identificador del boleto debe ser texto.');
+  const id = value.normalize('NFC').trim();
+  if (!id || id.length > 100 || /[\u0000-\u001f\u007f]/u.test(id)) {
+    throw new TypeError('Cada boleto necesita un identificador de entre 1 y 100 caracteres, sin controles.');
+  }
+  return id;
+}
+
+/** Compare ticket IDs without losing the original printed spelling. */
+export function normalizeTicketId(value) {
+  const id = displayTicketId(value);
+  return /^\d+$/u.test(id) ? id.replace(/^0+(?=\d)/u, '') : id.toLocaleLowerCase('es');
+}
+
+/** Resolve a participant's ordinal ticket to its real ID, when provided. */
+export function ticketIdentity(participant, ordinal) {
+  if (!participant || !Number.isInteger(participant.tickets) || participant.tickets < 1
+      || !Number.isInteger(ordinal) || ordinal < 1 || ordinal > participant.tickets) {
+    throw new RangeError('El número del boleto no pertenece al participante.');
+  }
+  if (participant.ticketIds === undefined) return ordinal;
+  if (!Array.isArray(participant.ticketIds) || participant.ticketIds.length !== participant.tickets) {
+    throw new TypeError('La lista de identificadores no coincide con los boletos del participante.');
+  }
+  return displayTicketId(participant.ticketIds[ordinal - 1]);
+}
+
 /** Read one participant per line and keep the first spelling of each name. */
 export function parseParticipants(text) {
   if (typeof text !== 'string') {
@@ -106,8 +134,23 @@ export function parseTicketParticipants(text) {
   const byName = new Map();
   let totalTickets = 0;
   let firstRecord = true;
+  let numbered = false;
+  let nameColumn = 0;
+  let ticketColumn = 1;
+  const seenIds = new Set();
 
   for (const { fields, line } of ticketRecords(text)) {
+    if (firstRecord && fields.length === 2) {
+      const first = nameKey(fields[0]), second = nameKey(fields[1]);
+      if ((first === 'nombre' && second === 'boleto')
+          || (['numero', 'número'].includes(first) && second === 'nombre')) {
+        numbered = true;
+        nameColumn = first === 'nombre' ? 0 : 1;
+        ticketColumn = 1 - nameColumn;
+        firstRecord = false;
+        continue;
+      }
+    }
     if (firstRecord && fields.length === 2
         && ['nombre', 'participante', 'name'].includes(nameKey(fields[0]))
         && ['boletos', 'cantidad', 'tickets'].includes(nameKey(fields[1]))) {
@@ -115,14 +158,23 @@ export function parseTicketParticipants(text) {
       continue;
     }
     firstRecord = false;
-    if (fields.length > 2) throw lineError(line, 'se esperan nombre y cantidad; encierra entre comillas los nombres con coma.');
-    const name = displayName(fields[0]);
+    if (fields.length > 2 || (numbered && fields.length !== 2)) {
+      throw lineError(line, `se esperan nombre y ${numbered ? 'boleto' : 'cantidad'}; encierra entre comillas los nombres con coma.`);
+    }
+    const name = displayName(fields[nameColumn]);
     if (!name) throw lineError(line, 'el participante necesita un nombre.');
     if (name.length > 200) throw lineError(line, 'cada nombre puede tener hasta 200 caracteres.');
-    if (fields.length === 2 && !/^\d+$/u.test(fields[1])) {
+    let ticketId;
+    if (numbered) {
+      try { ticketId = displayTicketId(fields[ticketColumn]); }
+      catch (error) { throw lineError(line, error.message); }
+      const normalizedId = normalizeTicketId(ticketId);
+      if (seenIds.has(normalizedId)) throw lineError(line, `el boleto «${ticketId}» está repetido.`);
+      seenIds.add(normalizedId);
+    } else if (fields.length === 2 && !/^\d+$/u.test(fields[1])) {
       throw lineError(line, 'la cantidad de boletos debe ser un entero entre 1 y 1.000.000.');
     }
-    const tickets = fields.length === 1 ? 1 : Number(fields[1]);
+    const tickets = numbered || fields.length === 1 ? 1 : Number(fields[1]);
     if (!Number.isSafeInteger(tickets) || tickets < 1 || tickets > MAX_TICKETS_PER_PERSON) {
       throw lineError(line, 'la cantidad de boletos debe estar entre 1 y 1.000.000.');
     }
@@ -137,15 +189,58 @@ export function parseTicketParticipants(text) {
     if (totalTickets + tickets > UINT32_RANGE) {
       throw lineError(line, 'el total no puede superar 4.294.967.296 boletos.');
     }
-    if (existing) existing.tickets += tickets;
+    if (existing) {
+      existing.tickets += tickets;
+      if (numbered) existing.ticketIds.push(ticketId);
+    }
     else {
-      const participant = { name, tickets };
+      const participant = numbered ? { name, tickets, ticketIds: [ticketId] } : { name, tickets };
       participants.push(participant);
       byName.set(key, participant);
     }
     totalTickets += tickets;
   }
   return { participants, totalTickets };
+}
+
+/** Produce editable CSV without changing names, printed IDs, or legacy counts. */
+export function serializeTicketParticipants(participants) {
+  createTicketPool(participants);
+  const numbered = participants.length > 0 && participants[0].ticketIds !== undefined;
+  const rows = [numbered ? 'Nombre;Boleto' : 'Nombre;Boletos'];
+  const cell = (value) => `"${String(value).replaceAll('"', '""')}"`;
+  for (const participant of participants) {
+    if (numbered) {
+      for (const ticketId of participant.ticketIds) rows.push(`${cell(displayName(participant.name))};${cell(displayTicketId(ticketId))}`);
+    } else rows.push(`${cell(displayName(participant.name))};${participant.tickets}`);
+  }
+  return rows.join('\n');
+}
+
+/** Merge homogeneous lists, adding counts or real IDs for matching people. */
+export function mergeTicketParticipants(first, second) {
+  createTicketPool(first);
+  createTicketPool(second);
+  const numberedFirst = first.length ? first[0].ticketIds !== undefined : null;
+  const numberedSecond = second.length ? second[0].ticketIds !== undefined : null;
+  if (numberedFirst !== null && numberedSecond !== null && numberedFirst !== numberedSecond) {
+    throw new RangeError('No se pueden mezclar boletos numerados con cantidades. Usa un solo formato o vacía la lista antes de importar.');
+  }
+  const grouped = new Map();
+  for (const participant of [...first, ...second]) {
+    const key = nameKey(participant.name);
+    const existing = grouped.get(key);
+    if (existing) {
+      existing.tickets += participant.tickets;
+      if (existing.ticketIds) existing.ticketIds = existing.ticketIds.concat(participant.ticketIds);
+    } else grouped.set(key, {
+      name: displayName(participant.name), tickets: participant.tickets,
+      ...(participant.ticketIds ? { ticketIds: [...participant.ticketIds] } : {}),
+    });
+  }
+  const participants = [...grouped.values()];
+  createTicketPool(participants);
+  return participants;
 }
 
 /** Return an unbiased random integer from zero up to maxExclusive - 1. */
@@ -204,7 +299,12 @@ function createTicketPool(participants, { excludeNames = [], excludeTickets = []
   }
   const excludedNames = new Set(excludeNames.map(nameKey));
   const excludedTickets = new Map();
+  const excludedIds = new Set();
   for (const ticket of excludeTickets) {
+    if (ticket?.ticketId !== undefined) {
+      excludedIds.add(normalizeTicketId(ticket.ticketId));
+      continue;
+    }
     if (!ticket || typeof ticket.name !== 'string' || !displayName(ticket.name)
         || !Number.isInteger(ticket.ticketNumber) || ticket.ticketNumber < 1
         || ticket.ticketNumber > MAX_TICKETS_PER_PERSON) {
@@ -216,7 +316,9 @@ function createTicketPool(participants, { excludeNames = [], excludeTickets = []
   }
 
   const seen = new Set();
+  const seenIds = new Set();
   const pool = [];
+  let numbered;
   let declaredTotal = 0;
   let totalTickets = 0;
   for (const participant of participants) {
@@ -228,13 +330,34 @@ function createTicketPool(participants, { excludeNames = [], excludeTickets = []
     const key = nameKey(participant.name);
     if (seen.has(key)) throw new RangeError('La lista contiene participantes duplicados; combina sus boletos primero.');
     seen.add(key);
+    const hasIds = participant.ticketIds !== undefined;
+    if (numbered !== undefined && numbered !== hasIds) {
+      throw new RangeError('No se pueden mezclar boletos numerados con cantidades. Usa un solo formato.');
+    }
+    numbered = hasIds;
+    let ticketIds;
+    if (hasIds) {
+      if (!Array.isArray(participant.ticketIds) || participant.ticketIds.length !== participant.tickets) {
+        throw new TypeError('La lista de identificadores debe tener un identificador por boleto.');
+      }
+      ticketIds = Array.from(participant.ticketIds, displayTicketId);
+      for (const ticketId of ticketIds) {
+        const normalizedId = normalizeTicketId(ticketId);
+        if (seenIds.has(normalizedId)) throw new RangeError(`El boleto «${ticketId}» está repetido. Cada boleto debe ser único en toda la lista.`);
+        seenIds.add(normalizedId);
+      }
+    }
     declaredTotal += participant.tickets;
     if (declaredTotal > UINT32_RANGE) throw new RangeError('El total no puede superar 4.294.967.296 boletos.');
     if (excludedNames.has(key)) continue;
-    const removed = [...(excludedTickets.get(key) ?? [])].filter((number) => number <= participant.tickets).sort((a, b) => a - b);
+    const removed = hasIds
+      ? ticketIds.flatMap((id, index) => excludedIds.has(normalizeTicketId(id)) ? [index + 1] : [])
+      : [...(excludedTickets.get(key) ?? [])].filter((number) => number <= participant.tickets).sort((a, b) => a - b);
     const available = participant.tickets - removed.length;
     if (!available) continue;
-    pool.push({ name: displayName(participant.name), tickets: participant.tickets, available, initialAvailable: available, removed });
+    pool.push({ name: displayName(participant.name), tickets: participant.tickets, available, initialAvailable: available, removed,
+      ...(ticketIds ? { ticketIds } : {}),
+    });
     totalTickets += available;
   }
   return { pool, totalTickets };
@@ -281,6 +404,7 @@ export function drawTicketWinners(participants, count, {
     winners.push({
       name: selected.name, ticketNumber, tickets: selected.tickets,
       probability: selected.initialAvailable / initialTotal,
+      ...(selected.ticketIds ? { ticketId: selected.ticketIds[ticketNumber - 1] } : {}),
     });
     if (uniquePeople) {
       totalTickets -= selected.available;
@@ -321,6 +445,8 @@ export function resultsToCSV(draw) {
         || nameKey(detail.name) !== nameKey(winners[index]) || !Number.isInteger(detail.tickets)
         || detail.tickets < 1 || detail.tickets > MAX_TICKETS_PER_PERSON
         || !Number.isInteger(detail.ticketNumber) || detail.ticketNumber < 1 || detail.ticketNumber > detail.tickets
+        || (detail.ticketId !== undefined && (typeof detail.ticketId !== 'string' || !detail.ticketId.trim()
+          || detail.ticketId.length > 100 || /[\u0000-\u001f\u007f]/u.test(detail.ticketId)))
         || !Number.isFinite(detail.probability) || detail.probability <= 0 || detail.probability > 1))) {
     throw new TypeError('Los detalles de los boletos ganadores no son válidos.');
   }
@@ -330,7 +456,7 @@ export function resultsToCSV(draw) {
     const row = [index + 1, winner, draw.title, date.toISOString()];
     if (hasDetails) {
       const detail = details[index];
-      row.push(draw.stageName ?? draw.stage ?? '', draw.prize ?? '', detail.ticketNumber, detail.tickets,
+      row.push(draw.stageName ?? draw.stage ?? '', draw.prize ?? '', detail.ticketId ?? detail.ticketNumber, detail.tickets,
         `${Number((detail.probability * 100).toPrecision(10))}%`);
     }
     rows.push(row);

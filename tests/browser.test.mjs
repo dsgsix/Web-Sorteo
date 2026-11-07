@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createStaticServer } from '../scripts/serve.mjs';
+import { createWorkbookFixture } from './fixtures/workbook.mjs';
 
 const browserPath = process.env.BROWSER_PATH || '/usr/bin/chromium';
 
@@ -169,7 +170,7 @@ test('Sortea funciona en Chromium de escritorio y móvil', { timeout: 90000 }, a
   };
   const statistic = async selector => Number((await text(selector)).match(/[0-9]+/)[0]);
   const historyCount = () => statistic('#history-count');
-  const winnerDetails = () => evaluate(`[...document.querySelectorAll('#winner-list li')].map(item => ({name:item.querySelector('.winner-name')?.textContent, meta:item.querySelector('.winner-meta')?.textContent}))`);
+  const winnerDetails = () => evaluate(`[...document.querySelectorAll('#winner-list li')].map(item => ({name:item.querySelector('.winner-name')?.textContent, ticket:item.querySelector('.winner-ticket')?.textContent, meta:item.querySelector('.winner-meta')?.textContent}))`);
   const upload = async (selector, file) => {
     const { root } = await cdp.send('DOM.getDocument');
     const { nodeId } = await cdp.send('DOM.querySelector', { nodeId: root.nodeId, selector });
@@ -211,7 +212,7 @@ test('Sortea funciona en Chromium de escritorio y móvil', { timeout: 90000 }, a
     const ana = rows.find(row => row[0].trim() === 'Ana');
     assert.ok(ana, 'debe agrupar Ana y ana');
     assert.match(ana[1], /3/);
-    const chance = Number(ana[2].replace(',', '.').match(/[0-9]+(?:\.[0-9]+)?/)[0]);
+    const chance = Number(ana.at(-1).replace(',', '.').match(/[0-9]+(?:\.[0-9]+)?/)[0]);
     assert.ok(Math.abs(chance - 300 / 7) < 0.6, `probabilidad inicial esperada de Ana: 3/7, recibida ${chance}%`);
     await fill('#winner-count', '2.5');
     await click('#draw-button');
@@ -308,7 +309,7 @@ test('Sortea funciona en Chromium de escritorio y móvil', { timeout: 90000 }, a
     assert.ok(firstWinners.every(name => ['Ana', 'Bruno', 'Carla', 'Diego'].includes(name)));
     const remaining = Object.entries({ Ana: 3, Bruno: 2, Carla: 1, Diego: 1 }).filter(([name]) => !firstWinners.includes(name)).reduce((sum, [, tickets]) => sum + tickets, 0);
     assert.equal(await statistic('#eligible-total'), remaining);
-    assert.ok((await winnerDetails()).every(winner => /boleto/i.test(winner.meta)));
+    assert.ok((await winnerDetails()).every(winner => /boleto/i.test(winner.ticket)));
     assert.equal(await evaluate(`document.getElementById('draw-button').disabled`), true, 'una etapa completada no se repite');
     assert.equal(await evaluate(`document.getElementById('next-stage').hidden`), false);
     await click('#next-stage');
@@ -371,13 +372,13 @@ test('Sortea funciona en Chromium de escritorio y móvil', { timeout: 90000 }, a
     await fill(`${stageSelector(2)} .stage-winner-count`, '1');
     await completeDraw(3);
     assert.deepEqual(await winners(), ['Solo']);
-    const firstTicket = (await winnerDetails())[0].meta.match(/boleto\s*#?\s*(\d+)/i)?.[1];
+    const firstTicket = (await winnerDetails())[0].ticket.match(/\d+/)?.[0];
     assert.ok(firstTicket, 'el resultado debe indicar el número del boleto');
     assert.equal(await statistic('#eligible-total'), 2);
     await click('#next-stage');
     await completeDraw(4);
     assert.deepEqual(await winners(), ['Solo']);
-    const nextTicket = (await winnerDetails())[0].meta.match(/boleto\s*#?\s*(\d+)/i)?.[1];
+    const nextTicket = (await winnerDetails())[0].ticket.match(/\d+/)?.[0];
     assert.ok(nextTicket);
     assert.notEqual(nextTicket, firstTicket);
     assert.equal(await statistic('#eligible-total'), 1);
@@ -444,6 +445,139 @@ test('Sortea funciona en Chromium de escritorio y móvil', { timeout: 90000 }, a
     await waitFor(`document.getElementById('history-count')?.textContent === '1'`, 'debe recuperar solo el resultado válido');
     assert.doesNotMatch(await text('#history-list'), /Corrupto/);
     assert.equal(await statistic('#ticket-total'), 9);
+  });
+
+  const workbookFile = path.join(temporary, 'boletos-sinteticos.xlsx');
+  await t.test('revisa hojas de Excel e incluye todos los boletos con nombre, con o sin pago', async () => {
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1100, deviceScaleFactor: 1, mobile: false });
+    await resetSession();
+    await fill('#participants', 'Antes;9');
+    await fill('#raffle-title', 'Sorteo numerado');
+    const before = await evaluate(`localStorage.getItem('sortea.workspace.v2')`);
+    await writeFile(workbookFile, createWorkbookFixture());
+    await upload('#file-input', workbookFile);
+    await waitFor(`document.getElementById('import-dialog').open`, 'debe revisar el Excel antes de reemplazar la lista');
+    assert.match(await text('#import-summary'), /3 boletos de 2 personas/);
+    assert.match(await text('#import-summary'), /2 filas sin nombre o vacías/);
+    assert.match(await text('#import-warning'), /todos los boletos con nombre/);
+    assert.equal(await evaluate(`document.querySelectorAll('#import-sheet option').length`), 2);
+    assert.equal(await evaluate(`document.getElementById('participants').value`), 'Antes;9');
+    const preview = await evaluate(`[...document.querySelectorAll('#import-preview tr')].map(row => [...row.cells].map(cell => cell.textContent))`);
+    assert.deepEqual(preview, [['001', 'Ana Pérez'], ['017', 'Ana Pérez'], ['104', 'Bruno']]);
+    await screenshot('/tmp/sortea-import-desktop.png');
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width: 320, height: 844, deviceScaleFactor: 1, mobile: true });
+    assert.equal(await evaluate(`document.documentElement.scrollWidth <= window.innerWidth`), true, 'el diálogo de Excel debe caber en móvil');
+    await screenshot('/tmp/sortea-import-mobile.png');
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1100, deviceScaleFactor: 1, mobile: false });
+    await fill('#import-sheet', '1');
+    assert.match(await text('#import-summary'), /1 boletos de 1 personas/);
+    assert.match(await text('#import-preview'), /A-007/);
+    assert.match(await text('#import-preview'), /Invitado de prueba/);
+    await fill('#import-sheet', '0');
+    await click('#import-cancel');
+    assert.equal(await evaluate(`document.getElementById('import-dialog').open`), false);
+    assert.equal(await evaluate(`localStorage.getItem('sortea.workspace.v2')`), before, 'cancelar no modifica participantes ni configuración');
+  });
+
+  await t.test('confirma el reemplazo por números reales y conserva configuración e historial', async () => {
+    const before = await evaluate(`(() => { const value = JSON.parse(localStorage.getItem('sortea.workspace.v2')); return {title:value.title, stages:value.stages, history:value.history, sessionId:value.sessionId}; })()`);
+    await upload('#file-input', workbookFile);
+    await waitFor(`document.getElementById('import-dialog').open`, 'debe abrir la revisión de nuevo');
+    assert.equal(await evaluate(`document.getElementById('import-confirm').disabled`), false);
+    await click('#import-confirm');
+    await waitFor(`!document.getElementById('import-dialog').open`, 'debe confirmar el Excel');
+    assert.equal(await statistic('#participants-count'), 2);
+    assert.equal(await statistic('#ticket-total'), 3);
+    assert.equal(await statistic('#eligible-total'), 3);
+    const numbered = await evaluate(`document.getElementById('participants').value`);
+    assert.match(numbered, /^Nombre;Boleto\n/);
+    assert.match(numbered, /001/);
+    assert.match(numbered, /017/);
+    assert.doesNotMatch(numbered, /Antes|999/);
+    assert.deepEqual(await evaluate(`(() => { const value = JSON.parse(localStorage.getItem('sortea.workspace.v2')); return {title:value.title, stages:value.stages, history:value.history, sessionId:value.sessionId}; })()`), before);
+    await cdp.send('Page.reload');
+    await waitFor(`document.getElementById('ticket-total')?.textContent === '3'`, 'debe recuperar los boletos numerados');
+    assert.equal(await evaluate(`document.getElementById('participants').value`), numbered);
+    const rows = await evaluate(`[...document.querySelectorAll('#participants-preview tr')].map(row => [...row.cells].map(cell => cell.textContent))`);
+    assert.equal(rows.length, 2);
+    assert.match(rows.find(row => row[0] === 'Ana Pérez')[2], /001.*017/);
+    assert.match(rows.find(row => row[0] === 'Bruno')[2], /104/);
+  });
+
+  await t.test('rechaza números duplicados y mezclas de modos sin alterar la lista válida', async () => {
+    const before = await evaluate(`localStorage.getItem('sortea.workspace.v2')`);
+    const duplicateWorkbook = path.join(temporary, 'boletos-duplicados.xlsx');
+    await writeFile(duplicateWorkbook, createWorkbookFixture({ duplicate: true }));
+    await upload('#file-input', duplicateWorkbook);
+    await waitFor(`document.getElementById('import-dialog').open`, 'debe revisar el Excel con duplicados');
+    assert.equal(await evaluate(`document.getElementById('import-confirm').disabled`), true);
+    assert.equal(await evaluate(`document.getElementById('import-error').hidden`), false);
+    assert.match(await text('#import-error'), /duplicad|repetid/iu);
+    await click('#import-cancel');
+    assert.equal(await evaluate(`localStorage.getItem('sortea.workspace.v2')`), before);
+    const invalidLists = [
+      ['duplicados.csv', 'Nombre;Boleto\nOtra;777\nAlguien;777', /duplicad|repetid/iu],
+      ['cantidades.csv', 'Nombre;Boletos\nIntruso;2', /mezclar|formato/iu],
+    ];
+    for (const [filename, content, expected] of invalidLists) {
+      const file = path.join(temporary, filename);
+      await writeFile(file, content, 'utf8');
+      await upload('#file-input', file);
+      await waitFor(`!document.getElementById('form-error').hidden && !document.getElementById('file-input').disabled`, `${filename} debe rechazarse`);
+      assert.match(await text('#form-error'), expected);
+      assert.equal(await evaluate(`localStorage.getItem('sortea.workspace.v2')`), before);
+    }
+  });
+
+  let firstRealTicket;
+  await t.test('destaca el número real, lo persiste y permite ganar a la misma persona con otro boleto', async () => {
+    await fill('#participants', 'Nombre;Boleto\nAna Pérez;001\nAna Pérez;017');
+    if (await evaluate(`document.getElementById('exclude-winners').checked`)) await click('#exclude-winners');
+    await fill('#winner-count', '1');
+    await fill(`${stageSelector(2)} .stage-winner-count`, '1');
+    await completeDraw(2);
+    assert.deepEqual(await winners(), ['Ana Pérez']);
+    firstRealTicket = (await winnerDetails())[0].ticket.match(/\d+/)?.[0];
+    assert.ok(['001', '017'].includes(firstRealTicket));
+    assert.match((await winnerDetails())[0].ticket, /^Boleto N\.º /);
+    assert.equal(await evaluate(`JSON.parse(localStorage.getItem('sortea.workspace.v2')).history[0].winnerDetails[0].ticketId`), firstRealTicket);
+    assert.equal(await statistic('#eligible-total'), 1);
+    await cdp.send('Page.reload');
+    await waitFor(`document.getElementById('history-count')?.textContent === '2'`, 'debe recuperar el premio con número real');
+    assert.equal((await winnerDetails())[0].ticket.match(/\d+/)?.[0], firstRealTicket);
+    // Reordering IDs changes internal positions, but must not change which ID is spent.
+    await fill('#participants', 'Nombre;Boleto\nAna Pérez;017\nAna Pérez;001');
+    assert.equal(await statistic('#eligible-total'), 1);
+    await click('#next-stage');
+    await completeDraw(3);
+    assert.deepEqual(await winners(), ['Ana Pérez']);
+    const secondRealTicket = (await winnerDetails())[0].ticket.match(/\d+/)?.[0];
+    assert.ok(['001', '017'].includes(secondRealTicket));
+    assert.notEqual(secondRealTicket, firstRealTicket);
+    assert.equal(await statistic('#eligible-total'), 0);
+    const historyIds = await evaluate(`JSON.parse(localStorage.getItem('sortea.workspace.v2')).history.slice(0, 2).map(draw => draw.winnerDetails[0].ticketId).sort()`);
+    assert.deepEqual(historyIds, ['001', '017']);
+    await evaluate(`window.scrollTo({ top: document.getElementById('stage-card').getBoundingClientRect().top + window.scrollY - 24, behavior: 'instant' })`);
+    await screenshot('/tmp/sortea-numbered-result.png');
+  });
+
+  await t.test('exporta y copia el identificador real sin perder los ceros iniciales', async () => {
+    const ticket = (await winnerDetails())[0].ticket.match(/\d+/)?.[0];
+    await rm(downloads, { recursive: true, force: true });
+    await mkdir(downloads);
+    await click('#download-results');
+    const filename = await until(async () => (await readdir(downloads)).find(name => name.endsWith('.csv')), 'debe descargar el CSV numerado');
+    const csv = await readFile(path.join(downloads, filename), 'utf8');
+    assert.ok(csv.includes(`"${ticket}"`), 'el CSV debe contener el ID original como campo entrecomillado');
+    assert.ok(csv.includes('Sorteo numerado'));
+    assert.ok(csv.includes('Ana Pérez'));
+    await cdp.send('Browser.grantPermissions', { origin, permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'] });
+    await cdp.send('Page.bringToFront');
+    await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+    await click('#copy-results');
+    const copied = await evaluate(`navigator.clipboard.readText()`);
+    assert.ok(copied.includes(ticket));
+    assert.ok(copied.includes('Ana Pérez'));
   });
 
   await t.test('migra el historial anterior sin restar boletos al evento nuevo', async () => {

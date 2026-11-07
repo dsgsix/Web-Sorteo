@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   drawWinners, parseParticipants, resultsToCSV, secureRandomInt, normalizeNameKey,
   parseTicketParticipants, drawTicketWinners, ticketPoolSummary,
+  serializeTicketParticipants, mergeTicketParticipants, ticketIdentity, normalizeTicketId,
 } from '../src/lib/raffle.js';
 
 test('participant parsing removes blanks and recognizes different line endings', () => {
@@ -276,5 +277,146 @@ test('weighted CSV rejects mismatched or invalid ticket details', () => {
     [{ name: 'Ana', tickets: 1, ticketNumber: 2, probability: 1 }],
     [{ name: 'Ana', tickets: 1, ticketNumber: 1, probability: 0 }]]) {
     assert.throws(() => resultsToCSV({ ...draw, winnerDetails }), TypeError);
+  }
+});
+
+test('singular Boleto header imports one real ticket per row and preserves printed IDs', () => {
+  assert.deepEqual(parseTicketParticipants('\uFEFFNombre;Boleto\r\nAna;001\r\nLuis;A-007\r\nANA;002\r\n'), {
+    participants: [
+      { name: 'Ana', tickets: 2, ticketIds: ['001', '002'] },
+      { name: 'Luis', tickets: 1, ticketIds: ['A-007'] },
+    ], totalTickets: 3,
+  });
+  assert.deepEqual(parseTicketParticipants('Número,Nombre\n"C,004","Pérez, Ana"'), {
+    participants: [{ name: 'Pérez, Ana', tickets: 1, ticketIds: ['C,004'] }], totalTickets: 1,
+  });
+  assert.deepEqual(parseTicketParticipants('Numero;Nombre\n0008;Ana'), {
+    participants: [{ name: 'Ana', tickets: 1, ticketIds: ['0008'] }], totalTickets: 1,
+  });
+  assert.deepEqual(parseTicketParticipants('Nombre;Boletos\nAna;003'), {
+    participants: [{ name: 'Ana', tickets: 3 }], totalTickets: 3,
+  });
+});
+
+test('real-ticket parsing rejects missing IDs, duplicates and numeric padding aliases by line', () => {
+  for (const suffix of ['Ana;', 'Ana', 'Ana;001\nLuis;1', 'Ana;A-007\nLuis;a-007', `Ana;${'X'.repeat(101)}`]) {
+    assert.throws(() => parseTicketParticipants(`Nombre;Boleto\n${suffix}`), /Línea [23]:/u);
+  }
+  assert.equal(normalizeTicketId('  000001 '), '1');
+  assert.equal(normalizeTicketId('000'), '0');
+  assert.equal(normalizeTicketId('A-007'), 'a-007');
+  assert.equal(normalizeTicketId('e\u0301-7'), normalizeTicketId('É-7'));
+  for (const invalid of [1, null, '', ' \t ', 'a\nb', 'a\0b', 'x'.repeat(101)]) {
+    assert.throws(() => normalizeTicketId(invalid), TypeError);
+  }
+});
+
+const numberedParticipants = [
+  { name: 'Ana', tickets: 3, ticketIds: ['001', '008', 'A-007'] },
+  { name: 'Luis', tickets: 1, ticketIds: ['020'] },
+];
+
+test('serialization roundtrips real IDs, quoted names and legacy counts without mutation', () => {
+  const snapshot = structuredClone(numberedParticipants);
+  const numberedCSV = serializeTicketParticipants(numberedParticipants);
+  assert.ok(numberedCSV.startsWith('Nombre;Boleto\n'));
+  assert.deepEqual(parseTicketParticipants(numberedCSV), { participants: numberedParticipants, totalTickets: 4 });
+  assert.deepEqual(numberedParticipants, snapshot);
+  const tricky = [{ name: 'Ana "A", Pérez; López', tickets: 1, ticketIds: ['00;5'] }];
+  assert.deepEqual(parseTicketParticipants(serializeTicketParticipants(tricky)).participants, tricky);
+  const countsCSV = serializeTicketParticipants(weightedParticipants);
+  assert.ok(countsCSV.startsWith('Nombre;Boletos\n'));
+  assert.deepEqual(parseTicketParticipants(countsCSV), { participants: weightedParticipants, totalTickets: 4 });
+  assert.deepEqual(parseTicketParticipants(serializeTicketParticipants([])), { participants: [], totalTickets: 0 });
+});
+
+test('ticket identity returns original IDs or legacy ordinals', () => {
+  assert.equal(ticketIdentity(numberedParticipants[0], 1), '001');
+  assert.equal(ticketIdentity(numberedParticipants[0], 3), 'A-007');
+  assert.equal(ticketIdentity(weightedParticipants[0], 2), 2);
+  for (const ordinal of [0, 4, 1.5, '1']) assert.throws(() => ticketIdentity(numberedParticipants[0], ordinal), RangeError);
+  assert.throws(() => ticketIdentity({ name: 'Ana', tickets: 2, ticketIds: ['001'] }, 1), TypeError);
+});
+
+test('merging groups matching owners while retaining real IDs and rejects mixed or duplicate tickets', () => {
+  const first = [{ name: 'Ana', tickets: 1, ticketIds: ['001'] }];
+  const second = [{ name: 'ANA', tickets: 1, ticketIds: ['002'] }, { name: 'Luis', tickets: 1, ticketIds: ['A-007'] }];
+  const snapshot = structuredClone([first, second]);
+  assert.deepEqual(mergeTicketParticipants(first, second), [
+    { name: 'Ana', tickets: 2, ticketIds: ['001', '002'] }, { name: 'Luis', tickets: 1, ticketIds: ['A-007'] },
+  ]);
+  assert.deepEqual([first, second], snapshot);
+  assert.deepEqual(mergeTicketParticipants([{ name: 'Ana', tickets: 2 }], [{ name: 'ANA', tickets: 3 }]), [{ name: 'Ana', tickets: 5 }]);
+  assert.deepEqual(mergeTicketParticipants([], first), first);
+  assert.throws(() => mergeTicketParticipants(first, [{ name: 'Luis', tickets: 1, ticketIds: ['1'] }]), /repetido/u);
+  assert.throws(() => mergeTicketParticipants(first, weightedParticipants), /mezclar boletos numerados con cantidades/u);
+});
+
+test('each real ticket occupies exactly one equal-probability interval in the draw', () => {
+  const expectedIds = ['001', '008', 'A-007', '020'];
+  for (let offset = 0; offset < 4; offset += 1) {
+    const [winner] = drawTicketWinners(numberedParticipants, 1, { randomInt: (bound) => {
+      assert.equal(bound, 4); return offset;
+    } });
+    assert.equal(winner.ticketId, expectedIds[offset]);
+    assert.equal(winner.ticketNumber, offset < 3 ? offset + 1 : 1);
+    assert.equal(winner.probability, offset < 3 ? 0.75 : 0.25);
+  }
+  const all = drawTicketWinners(numberedParticipants, 4, { uniquePeople: false, randomInt: () => 0 });
+  assert.deepEqual(all.map(({ ticketId }) => ticketId), expectedIds);
+  assert.equal(new Set(all.map(({ ticketId }) => ticketId)).size, 4);
+});
+
+test('real-ticket exclusions follow global IDs after rows reorder or owners change names', () => {
+  const changed = [
+    { name: 'Nombre corregido', tickets: 2, ticketIds: ['008', '001'] },
+    { name: 'Luis', tickets: 1, ticketIds: ['020'] },
+  ];
+  const options = { excludeTickets: [{ name: 'Ana', ticketNumber: 1, ticketId: '1' }, { ticketId: '000001' }] };
+  assert.deepEqual(ticketPoolSummary(changed, options), { eligibleParticipants: 2, totalTickets: 2 });
+  const all = drawTicketWinners(changed, 2, { ...options, uniquePeople: false, randomInt: () => 0 });
+  assert.deepEqual(all.map(({ ticketId }) => ticketId), ['008', '020']);
+  assert.equal(all[0].ticketNumber, 1);
+  assert.equal(all[0].tickets, 2);
+  assert.equal(all[0].probability, 0.5);
+  assert.deepEqual(ticketPoolSummary(numberedParticipants, { excludeTickets: [{ ticketId: 'a-007' }] }), {
+    eligibleParticipants: 2, totalTickets: 3,
+  });
+});
+
+test('ordinal exclusions never accidentally remove a real ticket and explicit IDs never remove legacy counts', () => {
+  assert.deepEqual(ticketPoolSummary(numberedParticipants, { excludeTickets: [{ name: 'Ana', ticketNumber: 1 }] }), {
+    eligibleParticipants: 2, totalTickets: 4,
+  });
+  assert.deepEqual(ticketPoolSummary(weightedParticipants, { excludeTickets: [{ name: 'Ana', ticketNumber: 1, ticketId: '001' }] }), {
+    eligibleParticipants: 2, totalTickets: 4,
+  });
+});
+
+test('real-ticket pools validate IDs globally before applying exclusions', () => {
+  const duplicate = [{ name: 'Ana', tickets: 1, ticketIds: ['001'] }, { name: 'Luis', tickets: 1, ticketIds: ['1'] }];
+  assert.throws(() => ticketPoolSummary(duplicate, { excludeNames: ['Ana'] }), /repetido/u);
+  for (const invalid of [
+    [{ name: 'Ana', tickets: 2, ticketIds: ['001'] }],
+    [{ name: 'Ana', tickets: 1, ticketIds: [1] }],
+    [{ name: 'Ana', tickets: 1, ticketIds: [''] }],
+    [{ name: 'Ana', tickets: 1, ticketIds: null }],
+    [{ name: 'Ana', tickets: 1, ticketIds: ['001'] }, { name: 'Luis', tickets: 1 }],
+  ]) {
+    assert.throws(() => drawTicketWinners(invalid, 1));
+    assert.throws(() => serializeTicketParticipants(invalid));
+  }
+});
+
+test('real winning IDs stay literal in CSV and formula-like IDs are neutralized', () => {
+  const draw = { title: 'Sorteo', createdAt: 0, winnerDetails: [
+    { name: 'Ana', tickets: 3, ticketNumber: 2, ticketId: '001', probability: 0.75 },
+  ] };
+  assert.ok(resultsToCSV(draw).includes(',"001","3","75%"'));
+  draw.winnerDetails[0].ticketId = '=1+1';
+  assert.ok(resultsToCSV(draw).includes(',"\'=1+1","3","75%"'));
+  for (const ticketId of ['', null, 1, 'x'.repeat(101), 'a\nb']) {
+    draw.winnerDetails[0].ticketId = ticketId;
+    assert.throws(() => resultsToCSV(draw), TypeError);
   }
 });
