@@ -135,6 +135,14 @@ test('Sortea funciona en Chromium de escritorio y móvil', { timeout: 90000 }, a
     const shot = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
     await writeFile(filename, Buffer.from(shot.data, 'base64'));
   };
+  const downloadCSV = async selector => {
+    await rm(downloads, { recursive: true, force: true });
+    await mkdir(downloads);
+    await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: downloads });
+    await click(selector);
+    const filename = await until(async () => (await readdir(downloads)).find(name => name.endsWith('.csv')), 'debe descargar la lista CSV completa');
+    return readFile(path.join(downloads, filename), 'utf8');
+  };
   await cdp.send('Page.navigate', { url: origin });
   await waitFor(`document.readyState === 'complete' && document.getElementById('draw-button')`, 'la aplicación debe cargar');
   await screenshot('/tmp/sortea-desktop.png');
@@ -146,7 +154,7 @@ test('Sortea funciona en Chromium de escritorio y móvil', { timeout: 90000 }, a
     const layout = await evaluate(`(() => {
       const cards = [...document.querySelectorAll('#stages-list .prize-card')];
       return {
-        pageFits: document.documentElement.scrollWidth <= window.innerWidth,
+        pageFits: document.documentElement.scrollWidth <= document.documentElement.clientWidth,
         cards: cards.map(card => {
           const bounds = card.getBoundingClientRect();
           const controls = [...card.querySelectorAll('input:not([hidden]), button')].filter(control => control.getClientRects().length).map(control => {
@@ -423,7 +431,7 @@ test('Sortea funciona en Chromium de escritorio y móvil', { timeout: 90000 }, a
     await cdp.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
     await evaluate('window.scrollTo(0, 0)');
     await screenshot('/tmp/sortea-mobile.png');
-    assert.ok(await evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'no debe desbordar horizontalmente');
+    assert.ok(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), 'no debe desbordar horizontalmente');
     await click('#help-button');
     assert.equal(await evaluate(`document.getElementById('help-dialog').open`), true);
     await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
@@ -466,7 +474,7 @@ test('Sortea funciona en Chromium de escritorio y móvil', { timeout: 90000 }, a
     assert.deepEqual(preview, [['001', 'Ana Pérez'], ['017', 'Ana Pérez'], ['104', 'Bruno']]);
     await screenshot('/tmp/sortea-import-desktop.png');
     await cdp.send('Emulation.setDeviceMetricsOverride', { width: 320, height: 844, deviceScaleFactor: 1, mobile: true });
-    assert.equal(await evaluate(`document.documentElement.scrollWidth <= window.innerWidth`), true, 'el diálogo de Excel debe caber en móvil');
+    assert.equal(await evaluate(`document.documentElement.scrollWidth <= document.documentElement.clientWidth`), true, 'el diálogo de Excel debe caber en móvil');
     await screenshot('/tmp/sortea-import-mobile.png');
     await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1100, deviceScaleFactor: 1, mobile: false });
     await fill('#import-sheet', '1');
@@ -578,6 +586,123 @@ test('Sortea funciona en Chromium de escritorio y móvil', { timeout: 90000 }, a
     const copied = await evaluate(`navigator.clipboard.readText()`);
     assert.ok(copied.includes(ticket));
     assert.ok(copied.includes('Ana Pérez'));
+  });
+
+  await t.test('muestra todos los boletos de un Excel grande y exporta la hoja completa pese a buscar', async () => {
+    await resetSession();
+    const before = await evaluate(`localStorage.getItem('sortea.workspace.v2')`);
+    const largeWorkbook = path.join(temporary, 'lista-completa-sintetica.xlsx');
+    await writeFile(largeWorkbook, createWorkbookFixture({ large: true }));
+    await upload('#file-input', largeWorkbook);
+    await waitFor(`document.getElementById('import-dialog').open`, 'debe revisar la hoja completa');
+    assert.match(await text('#import-summary'), /170/);
+    assert.match(await text('#import-summary'), /151/);
+    assert.match(await text('#import-summary'), /172/);
+    assert.equal(await evaluate(`document.querySelectorAll('#import-preview tr').length`), 170, 'debe renderizar también las filas posteriores a la décima');
+    assert.deepEqual((await text('#import-visible')).match(/\d+/g).map(Number), [170, 170]);
+    assert.match(await text('#import-preview tr:last-child'), /0002/);
+    assert.match(await text('#import-preview tr:last-child'), /Última persona/);
+    const scrolls = await evaluate(`(() => { const area = document.querySelector('.import-preview-scroll'); return area.scrollHeight > area.clientHeight; })()`);
+    assert.equal(scrolls, true, 'la tabla completa debe tener desplazamiento interno');
+    await fill('#import-search', '0002');
+    assert.equal(await evaluate(`document.querySelectorAll('#import-preview tr').length`), 1);
+    assert.deepEqual((await text('#import-visible')).match(/\d+/g).map(Number), [1, 170]);
+    assert.match(await text('#import-preview'), /Última persona/);
+    const csv = await downloadCSV('#import-download');
+    assert.equal(csv.trim().split(/\r?\n/u).length, 171, 'el CSV contiene encabezado y los 170 boletos, no solo la coincidencia');
+    assert.ok(csv.includes('0002'));
+    assert.ok(csv.includes('1001'));
+    assert.ok(csv.includes('2019'));
+    assert.ok(csv.includes('Participante 150'));
+    assert.equal(await evaluate(`localStorage.getItem('sortea.workspace.v2')`), before, 'buscar y descargar no importan ni modifican la lista actual');
+    await fill('#import-search', '');
+    assert.equal(await evaluate(`document.querySelectorAll('#import-preview tr').length`), 170);
+    assert.deepEqual((await text('#import-visible')).match(/\d+/g).map(Number), [170, 170]);
+    await screenshot('/tmp/sortea-import-complete.png');
+    await click('#import-confirm');
+    await waitFor(`!document.getElementById('import-dialog').open`, 'debe importar todos los boletos de la hoja');
+    assert.equal(await statistic('#ticket-total'), 170);
+  });
+
+  let completeRosterCSV;
+  await t.test('muestra más de cien personas y todos sus números sin recortar ni limitar el CSV por búsqueda', async () => {
+    assert.equal(await statistic('#participants-count'), 151);
+    assert.equal(await evaluate(`document.querySelectorAll('#participants-preview tr').length`), 151, 'debe incluir a las personas posteriores a la centésima');
+    assert.deepEqual((await text('#participants-visible')).match(/\d+/g).map(Number), [151, 151]);
+    assert.match(await text('#participants-preview tr:last-child'), /Última persona/);
+    assert.match(await text('#participants-preview tr:last-child'), /0002/);
+    const firstPerson = '#participants-preview tr:first-child';
+    assert.match(await text(firstPerson), /Participante 001/);
+    assert.equal(await evaluate(`document.querySelector('${firstPerson} details.participant-ticket-list') !== null`), true);
+    await click(`${firstPerson} details.participant-ticket-list summary`);
+    assert.equal(await evaluate(`document.querySelector('${firstPerson} details.participant-ticket-list').open`), true);
+    const ticketList = await text(`${firstPerson} details.participant-ticket-list`);
+    const expectedIds = ['1001', ...Array.from({ length: 19 }, (_, index) => String(2001 + index))];
+    for (const id of expectedIds) assert.ok(ticketList.includes(id), `debe mostrar el boleto ${id}, aunque sea posterior al duodécimo`);
+    const before = await evaluate(`document.getElementById('participants').value`);
+    await fill('#participants-search', '0002');
+    assert.equal(await evaluate(`document.querySelectorAll('#participants-preview tr').length`), 1);
+    assert.deepEqual((await text('#participants-visible')).match(/\d+/g).map(Number), [1, 151]);
+    assert.match(await text('#participants-preview'), /Última persona/);
+    assert.equal(await statistic('#participants-count'), 151);
+    assert.equal(await statistic('#ticket-total'), 170);
+    assert.equal(await statistic('#eligible-total'), 170);
+    const beforeEnter = await historyCount();
+    await evaluate(`document.getElementById('participants-search').focus()`);
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', text: '\r', unmodifiedText: '\r', windowsVirtualKeyCode: 13 });
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await delay(180);
+    assert.equal(await historyCount(), beforeEnter, 'Enter en la búsqueda no debe sortear el premio');
+    assert.equal(await evaluate(`document.getElementById('stage-card').getAttribute('aria-busy')`), 'false');
+    assert.equal(await evaluate(`document.getElementById('participants').value`), before);
+    const csv = await downloadCSV('#download-participants');
+    completeRosterCSV = csv;
+    assert.equal(csv.trim().split(/\r?\n/u).length, 171, 'la descarga contiene todos los boletos de las 151 personas');
+    for (const id of expectedIds) assert.ok(csv.includes(id));
+    assert.ok(csv.includes('0002'));
+    assert.ok(csv.includes('Participante 150'));
+    assert.equal(await evaluate(`document.getElementById('participants').value`), before);
+    await fill('#participants-search', '');
+    assert.equal(await evaluate(`document.querySelectorAll('#participants-preview tr').length`), 151);
+    assert.deepEqual((await text('#participants-visible')).match(/\d+/g).map(Number), [151, 151]);
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width: 320, height: 844, deviceScaleFactor: 1, mobile: true });
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), true, 'la lista completa debe caber en móvil sin ensanchar el viewport');
+    assert.equal(await evaluate('document.documentElement.clientWidth'), 320);
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1100, deviceScaleFactor: 1, mobile: false });
+  });
+
+  await t.test('vuelve a importar el CSV completo como reemplazo sin duplicar boletos', async () => {
+    const before = await evaluate(`localStorage.getItem('sortea.workspace.v2')`);
+    const file = path.join(temporary, 'lista-completa-descargada.csv');
+    await writeFile(file, completeRosterCSV, 'utf8');
+    await fill('#participants-search', '0002');
+    await upload('#file-input', file);
+    await waitFor(`document.getElementById('import-dialog').open`, 'un CSV numerado debe abrir la revisión de reemplazo');
+    assert.equal(await evaluate(`document.getElementById('import-confirm').disabled`), false);
+    assert.equal(await evaluate(`document.getElementById('import-error').hidden`), true);
+    assert.equal(await evaluate(`document.querySelectorAll('#import-preview tr').length`), 170);
+    assert.match(await text('#import-summary'), /170 boletos de 151 personas/);
+    await click('#import-confirm');
+    await waitFor(`!document.getElementById('import-dialog').open`, 'debe aceptar la lista descargada');
+    assert.equal(await statistic('#participants-count'), 151);
+    assert.equal(await statistic('#ticket-total'), 170);
+    assert.equal(await evaluate(`localStorage.getItem('sortea.workspace.v2')`), before, 'reimportar la misma lista mantiene boletos, configuración y resultados');
+    assert.equal(await evaluate(`document.querySelectorAll('#participants-preview tr').length`), 151);
+  });
+
+  await t.test('la búsqueda visual no reduce el conjunto de participantes del sorteo', async () => {
+    await fill('#participants-search', '0002');
+    assert.equal(await evaluate(`document.querySelectorAll('#participants-preview tr').length`), 1);
+    if (!await evaluate(`document.getElementById('exclude-winners').checked`)) await click('#exclude-winners');
+    await fill('#winner-count', '2');
+    const expectedHistory = await historyCount() + 1;
+    await completeDraw(expectedHistory);
+    assert.equal((await winners()).length, 2);
+    assert.equal(new Set(await winners()).size, 2, 'deben poder ganar dos personas aunque la búsqueda muestre una');
+    assert.equal(await statistic('#participants-count'), 151);
+    assert.equal(await statistic('#ticket-total'), 170);
+    await fill('#participants-search', '');
+    assert.equal(await evaluate(`document.querySelectorAll('#participants-preview tr').length`), 151);
   });
 
   await t.test('migra el historial anterior sin restar boletos al evento nuevo', async () => {

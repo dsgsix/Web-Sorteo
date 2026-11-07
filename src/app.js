@@ -25,6 +25,8 @@ let imageRenderVersion = 0;
 let storageWarningShown = false;
 let isImporting = false;
 let pendingImport = null;
+let participantViewState = null;
+const searchKey = (value) => String(value).normalize('NFD').replace(/\p{M}/gu, '').toLocaleLowerCase('es').replace(/\s+/gu, ' ').trim();
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -159,6 +161,7 @@ function updateParticipants() {
   let state;
   try { state = participantState(); }
   catch (error) {
+    participantViewState = null;
     $('participants-hint').textContent = error.message;
     $('participants-hint').classList.add('input-warning');
     $('participants').setAttribute('aria-invalid', 'true');
@@ -178,18 +181,58 @@ function updateParticipants() {
     `${state.eligiblePeople} personas y ${numberFormat.format(state.eligibleTickets)} boletos en juego. Los nombres repetidos suman boletos.` :
     'Un nombre por línea = 1 boleto. Usa Nombre;5 para asignar cinco.';
   $('participants-preview-wrap').hidden = !state.participants.length;
-  $('participants-preview').replaceChildren();
-  for (const person of state.available.slice(0, 100)) {
-    const row = element('tr');
-    row.append(element('td', '', person.name), element('td', '', numberFormat.format(person.tickets)),
-      element('td', 'participant-ticket-ids', person.ticketIds ? `${person.ticketIds.slice(0, 12).join(', ')}${person.ticketIds.length > 12 ? ` y ${person.ticketIds.length - 12} más` : ''}` : 'Numeración interna'),
-      element('td', '', state.eligibleTickets ? percent(person.available / state.eligibleTickets) : '0 %'));
-    $('participants-preview').append(row);
-  }
-  $('participant-summary').textContent = state.participants.length > 100 ? 'Se muestran los primeros 100 participantes; todos los boletos elegibles entran al sorteo.' : 'Probabilidad al inicio de la próxima etapa; cambia al retirar ganadores.';
+  participantViewState = state;
+  renderParticipantRows();
+  $('participant-summary').textContent = `Lista completa: ${numberFormat.format(state.participants.length)} personas y ${numberFormat.format(state.totalTickets)} boletos registrados. La probabilidad cambia al retirar ganadores.`;
   if (!isDrawing && !activeDraw) setStageStatus(state.eligibleTickets ? `${numberFormat.format(state.eligibleTickets)} boletos en juego` : 'Prepara tus boletos');
   updateControls();
 }
+
+function renderParticipantRows() {
+  const state = participantViewState;
+  $('participants-preview').replaceChildren();
+  if (!state) { $('participants-visible').textContent = ''; return; }
+  const query = searchKey($('participants-search').value);
+  const visible = state.available.filter((person) => !query || searchKey(person.name).includes(query) ||
+    person.ticketIds?.some((id) => searchKey(id).includes(query)));
+  for (const person of visible) {
+    const row = element('tr');
+    const tickets = element('td', 'participant-ticket-ids');
+    if (!person.ticketIds) tickets.textContent = 'Numeración interna';
+    else if (person.ticketIds.length <= 12) tickets.textContent = person.ticketIds.join(', ');
+    else {
+      const details = element('details', 'participant-ticket-list');
+      details.open = Boolean(query);
+      details.append(element('summary', '', `Ver los ${numberFormat.format(person.ticketIds.length)} boletos`));
+      const values = element('div', 'ticket-values');
+      for (const id of person.ticketIds) values.append(element('span', 'ticket-chip', id));
+      details.append(values); tickets.append(details);
+    }
+    row.append(element('td', '', person.name), element('td', '', numberFormat.format(person.tickets)),
+      tickets,
+      element('td', '', state.eligibleTickets ? percent(person.available / state.eligibleTickets) : '0 %'));
+    $('participants-preview').append(row);
+  }
+  $('participants-visible').textContent = `Mostrando ${numberFormat.format(visible.length)} de ${numberFormat.format(state.participants.length)} personas. La búsqueda no modifica los boletos en juego.`;
+}
+$('participants-search').addEventListener('input', renderParticipantRows);
+$('participants-search').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') event.preventDefault();
+});
+
+function downloadParticipantCSV(text, filename) {
+  const url = URL.createObjectURL(new Blob(['\uFEFF', text, '\r\n'], { type: 'text/csv;charset=utf-8;' }));
+  const anchor = element('a'); anchor.href = url; anchor.download = filename;
+  document.body.append(anchor); anchor.click(); anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+$('download-participants').addEventListener('click', () => {
+  try {
+    const parsed = parseTicketParticipants($('participants').value);
+    if (!parsed.participants.length) return;
+    downloadParticipantCSV(serializeTicketParticipants(parsed.participants), 'sortea-participantes.csv');
+  } catch (error) { showError(error.message, 'participants'); }
+});
 
 async function imageURL(imageId) {
   if (!imageId) return null;
@@ -476,13 +519,7 @@ $('file-input').addEventListener('change', async () => {
   try {
     if (/\.xlsx$/iu.test(file.name)) {
       const workbook = await readRaffleWorkbook(file);
-      pendingImport = { ...workbook, text: null };
-      $('import-sheet').replaceChildren();
-      for (const [index, sheet] of workbook.sheets.entries()) {
-        const option = element('option', '', sheet.name); option.value = String(index); $('import-sheet').append(option);
-      }
-      renderWorkbookPreview();
-      $('import-dialog').showModal();
+      openImportReview(workbook);
       return;
     }
     if (/\.xls$/iu.test(file.name)) throw new Error('Guarda el Excel como .xlsx antes de importarlo.');
@@ -490,22 +527,43 @@ $('file-input').addEventListener('change', async () => {
     const text = await file.text(); if (isDrawing) return;
     if (text.includes('\0')) throw new Error('Usa un archivo TXT o CSV en UTF-8.');
     const incoming = parseTicketParticipants(text);
+    if (incoming.participants.some((person) => person.ticketIds)) {
+      openImportReview({ sheets: [{ name: file.name, skippedEmpty: 0,
+        rows: incoming.participants.flatMap((person) => person.ticketIds.map((ticketId) => ({ name: person.name, ticketId }))),
+      }] });
+      return;
+    }
     const current = parseTicketParticipants($('participants').value);
     const combined = serializeTicketParticipants(mergeTicketParticipants(current.participants, incoming.participants));
     if (combined.length > MAX_TEXT) throw new Error('El contenido supera los 200.000 caracteres.');
     parseTicketParticipants(combined); $('participants').value = combined;
+    $('participants-search').value = '';
     hideError(); updateParticipants(); persist(); notify(incoming.participants.some((person) => person.ticketIds) ?
       'Boletos importados con sus números originales.' : 'Participantes importados. Se sumaron los boletos de los nombres existentes.');
   } catch (error) { showError(error.message || 'No se pudo leer el archivo.'); }
   finally { $('file-input').value = ''; isImporting = false; updateControls(); }
 });
 
+function openImportReview(workbook) {
+  pendingImport = { ...workbook, text: null, assigned: [] };
+  $('import-sheet').replaceChildren();
+  for (const [index, sheet] of workbook.sheets.entries()) {
+    const option = element('option', '', sheet.name); option.value = String(index); $('import-sheet').append(option);
+  }
+  $('import-search').value = '';
+  renderWorkbookPreview(); $('import-dialog').showModal();
+}
+
 function renderWorkbookPreview() {
   if (!pendingImport) return;
   pendingImport.text = null;
+  pendingImport.assigned = [];
+  $('import-search').value = '';
   $('import-error').hidden = true;
   $('import-confirm').disabled = true;
+  $('import-download').disabled = true;
   $('import-preview').replaceChildren();
+  $('import-visible').textContent = '';
   const sheet = pendingImport.sheets[Number($('import-sheet').value)];
   if (!sheet) return;
   const assigned = sheet.rows.filter((row) => row.name.trim());
@@ -519,11 +577,13 @@ function renderWorkbookPreview() {
     if (text.length > MAX_TEXT) throw new Error('Esta lista supera los 200.000 caracteres admitidos.');
     pendingImport.text = serializeTicketParticipants(parsed.participants);
     if (pendingImport.text.length > MAX_TEXT) throw new Error('Esta lista supera los 200.000 caracteres admitidos.');
-    $('import-summary').textContent = `${numberFormat.format(parsed.totalTickets)} boletos de ${numberFormat.format(parsed.participants.length)} personas. Se omiten ${numberFormat.format(unassigned)} filas sin nombre o vacías.`;
-    for (const row of assigned.slice(0, 10)) {
-      const item = element('tr'); item.append(element('td', '', row.ticketId), element('td', '', row.name)); $('import-preview').append(item);
-    }
+    const blank = sheet.skippedEmpty || 0;
+    const unassignedNumbered = sheet.rows.length - assigned.length;
+    $('import-summary').textContent = `${numberFormat.format(parsed.totalTickets)} boletos de ${numberFormat.format(parsed.participants.length)} personas. Se leyeron ${numberFormat.format(sheet.rows.length + blank)} filas de datos. Se omiten ${numberFormat.format(unassigned)} filas sin nombre o vacías: ${numberFormat.format(unassignedNumbered)} boletos sin nombre y ${numberFormat.format(blank)} filas vacías.`;
+    pendingImport.assigned = assigned;
+    renderImportRows();
     $('import-confirm').disabled = false;
+    $('import-download').disabled = false;
   } catch (error) {
     pendingImport.text = null;
     $('import-summary').textContent = `${numberFormat.format(assigned.length)} filas con nombre; ${numberFormat.format(unassigned)} sin nombre.`;
@@ -531,11 +591,26 @@ function renderWorkbookPreview() {
     $('import-error').hidden = false;
   }
 }
+function renderImportRows() {
+  const assigned = pendingImport?.assigned || [];
+  const query = searchKey($('import-search').value);
+  const visible = assigned.filter((row) => !query || searchKey(row.name).includes(query) || searchKey(row.ticketId).includes(query));
+  $('import-preview').replaceChildren();
+  for (const row of visible) {
+    const item = element('tr'); item.append(element('td', '', row.ticketId), element('td', '', row.name)); $('import-preview').append(item);
+  }
+  $('import-visible').textContent = `Mostrando ${numberFormat.format(visible.length)} de ${numberFormat.format(assigned.length)} boletos asignados. La importación y el CSV incluyen la lista completa.`;
+}
+$('import-search').addEventListener('input', renderImportRows);
+$('import-download').addEventListener('click', () => {
+  if (pendingImport?.text) downloadParticipantCSV(pendingImport.text, 'sortea-boletos.csv');
+});
 $('import-sheet').addEventListener('change', renderWorkbookPreview);
 $('import-confirm').addEventListener('click', () => {
   if (!pendingImport?.text || isDrawing) return;
   const imported = parseTicketParticipants(pendingImport.text);
   $('participants').value = pendingImport.text;
+  $('participants-search').value = '';
   pendingImport = null; $('import-dialog').close();
   hideError(); updateParticipants(); persist();
   notify(`${numberFormat.format(imported.totalTickets)} boletos importados con su numeración original. Los boletos sin nombre se omitieron.`);

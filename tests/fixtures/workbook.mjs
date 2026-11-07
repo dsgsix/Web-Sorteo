@@ -33,12 +33,21 @@ function zip(files) {
   return result;
 }
 
-export function createWorkbookFixture({ duplicate = false, formulaWithoutCache = false, malformedXML = false } = {}) {
+export function createWorkbookFixture({ duplicate = false, formulaWithoutCache = false, malformedXML = false, large = false } = {}) {
   const namespace = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
   const shared = ['N°', 'Estado', 'Nombre completo', 'Fecha de pago', 'Disponible', 'Ana Pérez', 'Bruno', '001', '017', '104', '999', 'Boleto', 'Nombre', 'Invitado de prueba', 'A-007'];
   const stringCell = (column, row, value) => `<c r="${column}${row}" t="s"><v>${shared.indexOf(value)}</v></c>`;
   const row = (number, ticket, name, paid = false, numeric = false) => `<row r="${number}">${numeric ? `<c r="A${number}" s="1"><v>1</v></c>` : stringCell('A', number, ticket)}${stringCell('B', number, 'Disponible')}${name ? stringCell('C', number, name) : ''}${paid ? `<c r="D${number}"><v>46231</v></c>` : ''}</row>`;
   const firstSheet = `<worksheet xmlns="${namespace}"><sheetData><row r="1">${stringCell('A', 1, 'N°')}${stringCell('B', 1, 'Estado')}${stringCell('C', 1, 'Nombre completo')}${stringCell('D', 1, 'Fecha de pago')}</row>${row(2, '001', 'Ana Pérez', true, !duplicate)}${row(3, '017', 'Ana Pérez')}${row(4, duplicate ? '001' : '104', 'Bruno', true)}${row(5, '999', '')}<row r="6"/>${formulaWithoutCache ? '<row r="7"><c r="A7"><f>1+1</f></c><c r="C7" t="inlineStr"><is><t>Nombre de fórmula</t></is></c></row>' : ''}</sheetData></worksheet>`;
+  // More rows than both former preview limits (100 people and 10 tickets).
+  // The final person owns 0002; the first owns 20 distinct tickets.
+  const largeAssigned = [
+    ...Array.from({ length: 150 }, (_, index) => [String(1001 + index), `Participante ${String(index + 1).padStart(3, '0')}`]),
+    ...Array.from({ length: 19 }, (_, index) => [String(2001 + index), 'Participante 001']),
+    ['0002', 'Última persona'],
+  ];
+  const inlineCell = (column, number, value) => `<c r="${column}${number}" t="inlineStr"><is><t>${escapeXML(value)}</t></is></c>`;
+  const largeSheet = `<worksheet xmlns="${namespace}"><sheetData><row r="1">${stringCell('A', 1, 'N°')}${stringCell('B', 1, 'Estado')}${stringCell('C', 1, 'Nombre completo')}${stringCell('D', 1, 'Fecha de pago')}</row>${largeAssigned.map(([ticket, name], index) => `<row r="${index + 2}">${inlineCell('A', index + 2, ticket)}${stringCell('B', index + 2, 'Disponible')}${inlineCell('C', index + 2, name)}</row>`).join('')}<row r="172">${inlineCell('A', 172, '9999')}${stringCell('B', 172, 'Disponible')}</row><row r="173"/></sheetData></worksheet>`;
   return zip({
     '[Content_Types].xml': '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>',
     '_rels/.rels': '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
@@ -46,7 +55,7 @@ export function createWorkbookFixture({ duplicate = false, formulaWithoutCache =
     'xl/_rels/workbook.xml.rels': '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>',
     'xl/sharedStrings.xml': `<sst xmlns="${namespace}" count="${shared.length}" uniqueCount="${shared.length}">${shared.map((value) => `<si><t>${escapeXML(value)}</t></si>`).join('')}</sst>`,
     'xl/styles.xml': `<styleSheet xmlns="${namespace}"><numFmts count="1"><numFmt numFmtId="164" formatCode="000"/></numFmts><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="164"/></cellXfs></styleSheet>`,
-    'xl/worksheets/sheet1.xml': malformedXML ? '<worksheet><' : firstSheet,
+    'xl/worksheets/sheet1.xml': malformedXML ? '<worksheet><' : large ? largeSheet : firstSheet,
     'xl/worksheets/sheet2.xml': `<worksheet xmlns="${namespace}"><sheetData><row r="1">${stringCell('A', 1, 'Boleto')}${stringCell('B', 1, 'Nombre')}</row><row r="2"><c r="A2" t="inlineStr"><is><t>A-007</t></is></c><c r="B2" t="inlineStr"><is><r><t>Invitado </t></r><r><t>de prueba</t></r></is></c></row></sheetData></worksheet>`,
   });
 }
